@@ -1,0 +1,166 @@
+name: Friends Link Health Check
+
+on:
+  schedule:
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-links:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check friends.json links and avatars
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'friends.json';
+            const content = fs.readFileSync(path, 'utf8');
+            const lines = content.split(/\r?\n/);
+
+            // Collect all URL fields with the line where they appear.
+            const targets = [];
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i];
+              const match = line.match(/"(link|avatarUrl)"\s*:\s*"([^"]+)"/);
+              if (match) {
+                targets.push({
+                  field: match[1],
+                  url: match[2],
+                  line: i + 1
+                });
+              }
+            }
+
+            async function requestOnce(url, method) {
+              const controller = new AbortController();
+              const timer = setTimeout(() => controller.abort(), 15000);
+              try {
+                const resp = await fetch(url, {
+                  method,
+                  redirect: 'follow',
+                  signal: controller.signal,
+                  headers: {
+                    'user-agent': 'friends-link-check-bot/1.0'
+                  }
+                });
+                return { ok: resp.ok, status: resp.status };
+              } catch (err) {
+                return { ok: false, status: 'ERR', error: err.message };
+              } finally {
+                clearTimeout(timer);
+              }
+            }
+
+            async function checkUrl(url) {
+              const head = await requestOnce(url, 'HEAD');
+              // Some sites reject HEAD; retry with GET before marking as failed.
+              if (head.status === 405 || head.status === 403 || head.status === 501) {
+                const getResp = await requestOnce(url, 'GET');
+                return getResp;
+              }
+              return head;
+            }
+
+            const broken = [];
+            for (const target of targets) {
+              const result = await checkUrl(target.url);
+              if (!result.ok) {
+                broken.push({
+                  ...target,
+                  status: result.status,
+                  error: result.error || ''
+                });
+              }
+            }
+
+            const summaryHeader = [
+              '# Friends Link Health Check Report',
+              '',
+              `- Checked at: ${new Date().toISOString()}`,
+              `- File: \`friends.json\``,
+              ''
+            ];
+
+            let issueBody = summaryHeader.join('\n');
+            if (broken.length === 0) {
+              issueBody += 'All links are reachable.';
+            } else {
+              issueBody += [
+                'Found unreachable URLs:',
+                '',
+                '| Field | URL | Status | Line | Error |',
+                '| --- | --- | --- | --- | --- |',
+                ...broken.map(item => {
+                  return `| ${item.field} | ${item.url} | ${item.status} | ${item.line} | ${item.error || '-'} |`;
+                })
+              ].join('\n');
+            }
+
+            fs.writeFileSync('friends-link-check-report.md', issueBody);
+            core.setOutput('has_broken', String(broken.length > 0));
+
+      - name: Create or update issue for unreachable links
+        if: steps.check.outputs.has_broken == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('friends-link-check-report.md', 'utf8');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const title = 'Friends links health check failed';
+            const label = 'friends-link-check';
+
+            // Ensure label exists.
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch (err) {
+              if (err.status === 404) {
+                await github.rest.issues.createLabel({
+                  owner,
+                  repo,
+                  name: label,
+                  color: 'd73a4a',
+                  description: 'Auto-created by friends link health check workflow'
+                });
+              } else {
+                throw err;
+              }
+            }
+
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              labels: label
+            });
+
+            const existing = openIssues.find(i => i.title === title);
+            if (existing) {
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: existing.number,
+                title,
+                body: report
+              });
+              core.info(`Updated issue #${existing.number}`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner,
+                repo,
+                title,
+                body: report,
+                labels: [label]
+              });
+              core.info(`Created issue #${created.data.number}`);
+            }
